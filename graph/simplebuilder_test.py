@@ -36,7 +36,7 @@ mesh2grid_edge_normalization_factor = None
 mask = np.load('./data/land_sea_mask1.4.npy')[0, 4]
 mask_flat = mask.flatten()
 # fine_mask_flat = np.load('../data/land_sea_mask.npy')[0, 4, ::3, ::3].flatten()
-fine_mask_flat = (np.load('./data/union_ocean_mask.npy')*np.load('./data/total0.25mask.npy')).flatten()
+fine_mask_flat = (np.load('./data/union_ocean_mask.npy')*np.load('./data/total0.25mask.npy')[0,4]).flatten()
 mercator = xr.open_dataset('./data/mercatorglorys12v1_gl12_mean_1993_2016_01.nc')
 
 class SimpleAdaptiveMeshBuilder:
@@ -1812,7 +1812,7 @@ if __name__ == "__main__":
     mask = np.load('../data/land_sea_mask1.4.npy')[0, 4]
     mask_flat = mask.flatten()
     # fine_mask_flat = np.load('../data/union_ocean_mask.npy').flatten()
-    fine_mask_flat = (np.load('../data/union_ocean_mask.npy') * np.load('../data/total0.25mask.npy')).flatten()
+    fine_mask_flat = (np.load('../data/union_ocean_mask.npy') * np.load('../data/total0.25mask.npy')[0,4]).flatten()
     grid_features = np.load('../data/climatology/mean1.4.npy')
     grid_features = np.nan_to_num(grid_features, nan=0)
     fine_grid_features = np.load('../data/climatology/mean.npy')
