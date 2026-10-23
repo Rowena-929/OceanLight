@@ -1,0 +1,491 @@
+"""FGN model module."""
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+import einops
+import numpy as np
+import torch
+import xarray as xr
+from huggingface_hub import PyTorchModelHubMixin
+from scipy import ndimage
+
+from layers.processor import Processor
+from graph.graph_builder import GraphBuilder
+from graph.simplebuilder_test import SimpleAdaptiveMeshBuilder
+from layers.decoder import Decoder
+from layers.encoder_fourier2 import Encoder
+from utils.batching import batch, hetero_batch
+
+
+@dataclass
+class FunctionalGenerativeNetworkConfig:
+    """Configuration for FunctionalGenerativeNetwork model."""
+
+    grid_lon: np.ndarray
+    grid_lat: np.ndarray
+    input_features_dim: int
+    output_features_dim: int
+    noise_dimension: int
+    hidden_dims: list = None
+    num_blocks: int = 24
+    num_heads: int = 4
+    splits: int = 6
+    num_hops: int = 6
+    device: torch.device = torch.device("cpu")
+    sparse: bool = False
+    use_edges_features: bool = True
+    scale_factor: float = 1.0
+
+    def __post_init__(self):
+        if self.hidden_dims is None:
+            self.hidden_dims = [768, 768]
+
+    def build(self) -> "FunctionalGenerativeNetwork":
+        """Build FunctionalGenerativeNetwork from this configuration."""
+        return FunctionalGenerativeNetwork(
+            grid_lon=self.grid_lon,
+            grid_lat=self.grid_lat,
+            input_features_dim=self.input_features_dim,
+            output_features_dim=self.output_features_dim,
+            noise_dimension=self.noise_dimension,
+            hidden_dims=self.hidden_dims,
+            num_blocks=self.num_blocks,
+            num_heads=self.num_heads,
+            splits=self.splits,
+            num_hops=self.num_hops,
+            device=self.device,
+            sparse=self.sparse,
+            use_edges_features=self.use_edges_features,
+            scale_factor=self.scale_factor,
+        )
+
+
+class FunctionalGenerativeNetwork(torch.nn.Module, PyTorchModelHubMixin):
+    """Functional Generative Network (FGN) for weather prediction.
+
+    This class defines a generative model that predicts future weather states
+    based on previous observations and noise levels.
+    """
+
+    def __init__(
+        self,
+        grid_lon: np.ndarray,
+        grid_lat: np.ndarray,
+        fine_lon: Optional[np.ndarray],
+        fine_lat: Optional[np.ndarray],
+        # fine_grid_features: Optional[np.ndarray],
+        input_features_dim: int,
+        output_features_dim: int,
+        noise_dimension: int,
+        hidden_dims: list[int] = [768, 768],
+        num_blocks: int = 24,
+        num_heads: int = 4,
+        splits: int = 6,
+        num_hops: int = 6,
+        device: torch.device = torch.device("cpu"),
+        sparse: bool = False,
+        use_edges_features: bool = True,
+        scale_factor: float = 1.0,
+    ):
+        """Initialize the FGN.
+
+        Args:
+            grid_lon (np.ndarray): array of longitudes.
+            grid_lat (np.ndarray): array of latitudes.
+            input_features_dim (int): dimension of the input features for a single timestep.
+            output_features_dim (int): dimension of the target features.
+            noise_dimension (int): dimension of the noise vector used for conditioning the model.
+            hidden_dims (list[int], optional): list of dimensions for the hidden layers in the MLPs
+                used in GenCast. This also determines the latent dimension. Defaults to [512, 512].
+            num_blocks (int, optional): number of transformer blocks in Processor. Defaults to 16.
+            num_heads (int, optional): number of heads for each transformer. Defaults to 4.
+            splits (int, optional): number of time to split the icosphere during graph building.
+                Defaults to 6.
+            num_hops (int, optional): the transformes will attention to the (2^num_hops)-neighbours
+                of each node. Defaults to 6.
+            device (torch.device, optional): device on which we want to build graph.
+                Defaults to torch.device("cpu").
+            sparse (bool): if true the processor will apply Sparse Attention using DGL backend.
+                Defaults to False.
+            use_edges_features (bool): if true use mesh edges features inside the Processor.
+                Defaults to True.
+            scale_factor (float):  in the Encoder the message passing output is multiplied by the
+                scale factor. This is important when you want to fine-tune a pretrained model to a
+                higher resolution. Defaults to 1.
+        """
+        super().__init__()
+        # ── 计时器 ──────────────────────────────────────
+        self.enable_timing = False  # 默认关闭，需要时手动开启
+        self._timer = {"encoder": [], "processor": [], "decoder": []}
+        # ────────────────────────────────────────────────
+        self.num_lon = 1440
+        self.num_lat = 681
+        self.input_features_dim = input_features_dim
+        self.output_features_dim = output_features_dim
+        self.use_edges_features = use_edges_features
+        self.noise_dimension = noise_dimension
+        fine_data = xr.open_dataset('./data/mercatorglorys12v1_gl12_mean_1993_2016_01.nc')
+        grid_features = np.load('./data/climatology/mean1.4.npy')
+        grid_features = np.nan_to_num(grid_features, nan=0).squeeze(0)
+        grid_features = np.transpose(grid_features, (1, 2, 0))  # shape: (121, 256, 94)
+        grid_features = grid_features.reshape(-1, 94)  # shape: (30976, 94)
+        # fine_lat = fine_data.latitude.values[::3]
+        # fine_lon = fine_data.longitude.values[::3]
+        fine_grid_features = np.load('./data/climatology/mean.npy')[:,:,::3,::3].astype(np.float32)
+        fine_grid_features = np.delete(fine_grid_features, [1], axis=1)
+        fine_grid_features = fine_grid_features.squeeze(0)
+
+        fine_grid_features = np.transpose(fine_grid_features, (1, 2, 0))
+        fine_grid_features = fine_grid_features.reshape(-1, 93)
+        fine_grid_features = np.nan_to_num(fine_grid_features, nan=0)
+
+        # Initialize graph
+        # print('start initialization')
+        # if fine_lon is not None:
+        #     self.graphs = GraphBuilder(
+        #         grid_lon=fine_lon,
+        #         grid_lat=fine_lat,
+        #         splits=splits,
+        #         num_hops=num_hops,
+        #         device=device,
+        #         add_edge_features_to_khop=use_edges_features,
+        #     )
+        # else:
+        #     self.graphs = GraphBuilder(
+        #         grid_lon=grid_lon,
+        #         grid_lat=grid_lat,
+        #         splits=splits,
+        #         num_hops=num_hops,
+        #         device=device,
+        #         add_edge_features_to_khop=use_edges_features,
+        #     )
+        # print(f"Mesh 节点的数量: {self.graphs._num_mesh_nodes}")
+        # print(f"Mesh 边的数量: {self.graphs.mesh_graph.num_edges}")
+
+        self.graphs = SimpleAdaptiveMeshBuilder(
+            path='./graph/simple_adaptive_mesh_builder.pkl',
+            # path=None,
+            # grid_lon=grid_lon,
+            # grid_lat=grid_lat,
+            # grid_features=grid_features,
+            # fine_grid_lon=fine_lon,
+            # fine_grid_lat=fine_lat,
+            # fine_grid_features=fine_grid_features,
+            grid_lon=fine_lon,
+            grid_lat=fine_lat,
+            grid_features=fine_grid_features,
+            pca_dim=1,
+            threshold_method="percentile",
+            gradient_threshold=0.1,
+            min_mesh_size=5,
+            num_hops=2,
+            device=device,
+            enable_hdbscan_refinement=True,
+            large_mesh_threshold=0.15,  # 15%阈值，更严格
+            hdbscan_min_cluster_size_factor=0.03,  # 最小聚类大小为mesh大小的3%
+            hdbscan_min_samples_factor=0.01,  # 最小样本数为mesh大小的1%
+            # large_mesh_threshold=0.10,  # 15%阈值，更严格
+            # hdbscan_min_cluster_size_factor=0.0002,  # 最小聚类大小为mesh大小的3%
+            # hdbscan_min_samples_factor=0.0001,  # 最小样本数为mesh大小的1%
+        )
+
+        self._register_graph()
+
+        # Initialize Encoder
+        self.encoder = Encoder(
+            grid_dim=input_features_dim + self.graphs.grid_nodes_dim,
+            mesh_dim=self.graphs.mesh_nodes_dim,
+            edge_dim=self.graphs.g2m_edges_dim,
+            hidden_dims=hidden_dims,
+            activation_layer=torch.nn.SiLU,
+            use_layer_norm=True,
+            scale_factor=scale_factor,
+            #傅里叶算子设置，如果不是傅里叶算子就注释掉下面两行######
+            grid_height=681, grid_width=1440,
+            fourier_modes_h=32, fourier_modes_w=64,
+            ###############################################
+        )
+
+        # Initialize Processor
+        if sparse and use_edges_features:
+            raise ValueError("Sparse processor don't support edges features.")
+
+        # self.processor = Processor(
+        #     latent_dim=hidden_dims[-1],
+        #     edges_dim=self.graphs.mesh_edges_dim if use_edges_features else None,
+        #     hidden_dims=hidden_dims,
+        #     num_blocks=num_blocks,
+        #     num_heads=num_heads,
+        #     noise_emb_dim=noise_dimension,
+        #     activation_layer=torch.nn.SiLU,
+        #     use_layer_norm=True,
+        #     sparse=sparse,
+        # )
+        self.processor = Processor(
+            # latent_dim=hidden_dims[-1],
+            hidden_dims=hidden_dims,
+            activation_layer=torch.nn.SiLU,
+            use_layer_norm=True,
+            num_layers=16,
+            # noise_emb_dim=32
+        )
+
+        # Initialize Decoder
+        self.decoder = Decoder(
+            edges_dim=self.graphs.m2g_edges_dim,
+            output_dim=output_features_dim,
+            hidden_dims=hidden_dims,
+            activation_layer=torch.nn.SiLU,
+            use_layer_norm=True,
+        )
+
+    def _run_encoder(self, grid_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # build big graph with batch_size disconnected copies of the graph, with features [(b n) f].
+        batch_size = grid_features.shape[0]
+        batched_senders, batched_receivers, batched_edge_index, batched_edge_attr = hetero_batch(
+            self.g2m_grid_nodes,
+            self.g2m_mesh_nodes,
+            self.g2m_edge_index,
+            self.g2m_edge_attr,
+            batch_size,
+        )
+        # load features.
+        grid_features = einops.rearrange(grid_features, "b n f -> (b n) f")
+        input_grid_nodes = torch.cat([grid_features, batched_senders], dim=-1)
+        input_mesh_nodes = batched_receivers
+        input_edge_attr = batched_edge_attr
+        edge_index = batched_edge_index
+
+        # run the encoder.
+        latent_grid_nodes, latent_mesh_nodes = self.encoder(
+            input_grid_nodes=input_grid_nodes,
+            input_mesh_nodes=input_mesh_nodes,
+            input_edge_attr=input_edge_attr,
+            edge_index=edge_index,
+        )
+
+        # restore nodes dimension: [b, n, f]
+        latent_grid_nodes = einops.rearrange(latent_grid_nodes, "(b n) f -> b n f", b=batch_size)
+        latent_mesh_nodes = einops.rearrange(latent_mesh_nodes, "(b n) f -> b n f", b=batch_size)
+
+        if torch.isnan(latent_grid_nodes).any():
+            for name, param in self.encoder.named_parameters():
+                if torch.isnan(param).any():
+                    print(f"NaN found in encoder parameter: {name}")
+            print(torch.isnan(latent_grid_nodes).sum())
+        # assert not torch.isnan(latent_grid_nodes).any()
+        # assert not torch.isnan(latent_mesh_nodes).any()
+        return latent_grid_nodes, latent_mesh_nodes
+
+    def _run_decoder(
+        self, latent_mesh_nodes: torch.Tensor, latent_grid_nodes: torch.Tensor
+    ) -> torch.Tensor:
+        # build big graph with batch_size disconnected copies of the graph, with features [(b n) f].
+        batch_size = latent_mesh_nodes.shape[0]
+        _, _, batched_edge_index, batched_edge_attr = hetero_batch(
+            self.m2g_mesh_nodes,
+            self.m2g_grid_nodes,
+            self.m2g_edge_index,
+            self.m2g_edge_attr,
+            batch_size,
+        )
+
+        # load features.
+        input_mesh_nodes = einops.rearrange(latent_mesh_nodes, "b n f -> (b n) f")
+        input_grid_nodes = einops.rearrange(latent_grid_nodes, "b n f -> (b n) f")
+        input_edge_attr = batched_edge_attr
+        edge_index = batched_edge_index
+        # run the decoder.
+        output_grid_nodes = self.decoder(
+            input_mesh_nodes=input_mesh_nodes,
+            input_grid_nodes=input_grid_nodes,
+            input_edge_attr=input_edge_attr,
+            edge_index=edge_index,
+        )
+
+        # restore nodes dimension: [b, n, f]
+        output_grid_nodes = einops.rearrange(output_grid_nodes, "(b n) f -> b n f", b=batch_size)
+
+        # assert not torch.isnan(output_grid_nodes).any()
+        return output_grid_nodes
+
+    def _run_processor(
+        self, latent_mesh_nodes: torch.Tensor, noise_vectors: torch.Tensor
+    ) -> torch.Tensor:
+        # build big graph with batch_size disconnected copies of the graph, with features [(b n) f].
+        batch_size = latent_mesh_nodes.shape[0]
+        num_nodes = latent_mesh_nodes.shape[1]
+        _, batched_edge_index, batched_edge_attr = batch(
+            self.mesh_nodes,
+            self.mesh_edge_index,
+            self.mesh_edge_attr if self.use_edges_features else None,
+            batch_size,
+        )
+
+        # load features.
+        latent_mesh_nodes = einops.rearrange(latent_mesh_nodes, "b n f -> (b n) f") #(2568,512)
+        input_edge_attr = batched_edge_attr
+        edge_index = batched_edge_index
+
+        # repeat noise levels for each node.
+        noise_vectors = einops.repeat(noise_vectors, "b f -> (b n) f", n=num_nodes)
+
+        # run the processor.
+        latent_mesh_nodes = self.processor.forward(
+            mesh_nodes=latent_mesh_nodes,
+            mesh_edges_attr=input_edge_attr,
+            mesh_edge_index=edge_index,
+            # noise_vector=noise_vectors
+        )
+
+        # restore nodes dimension: [b, n, f]
+        latent_mesh_nodes = einops.rearrange(latent_mesh_nodes, "(b n) f -> b n f", b=batch_size)
+
+        # assert not torch.isnan(latent_mesh_nodes).any()
+        return latent_mesh_nodes
+
+    def _register_graph(self):
+        # we need to register all the tensors associated with the graph as buffers. In this way they
+        # will move to the same device of the model. These tensors won't be part of the state since
+        # persistent is set to False.
+
+        self.register_buffer(
+            "g2m_grid_nodes", self.graphs.g2m_graph["grid_nodes"].x, persistent=False
+        )
+        self.register_buffer(
+            "g2m_mesh_nodes", self.graphs.g2m_graph["mesh_nodes"].x, persistent=False
+        )
+        self.register_buffer(
+            "g2m_edge_attr",
+            self.graphs.g2m_graph["grid_nodes", "to", "mesh_nodes"].edge_attr,
+            persistent=False,
+        )
+        self.register_buffer(
+            "g2m_edge_index",
+            self.graphs.g2m_graph["grid_nodes", "to", "mesh_nodes"].edge_index,
+            persistent=False,
+        )
+
+        self.register_buffer("mesh_nodes", self.graphs.mesh_graph.x, persistent=False)
+        self.register_buffer("mesh_edge_attr", self.graphs.mesh_graph.edge_attr, persistent=False)
+        self.register_buffer("mesh_edge_index", self.graphs.mesh_graph.edge_index, persistent=False)
+
+        self.register_buffer("khop_mesh_nodes", self.graphs.khop_mesh_graph.x, persistent=False)
+        self.register_buffer(
+            "khop_mesh_edge_attr", self.graphs.khop_mesh_graph.edge_attr, persistent=False
+        )
+        self.register_buffer(
+            "khop_mesh_edge_index", self.graphs.khop_mesh_graph.edge_index, persistent=False
+        )
+
+        self.register_buffer(
+            "m2g_grid_nodes", self.graphs.m2g_graph["grid_nodes"].x, persistent=False
+        )
+        self.register_buffer(
+            "m2g_mesh_nodes", self.graphs.m2g_graph["mesh_nodes"].x, persistent=False
+        )
+        self.register_buffer(
+            "m2g_edge_attr",
+            self.graphs.m2g_graph["mesh_nodes", "to", "grid_nodes"].edge_attr,
+            persistent=False,
+        )
+        self.register_buffer(
+            "m2g_edge_index",
+            self.graphs.m2g_graph["mesh_nodes", "to", "grid_nodes"].edge_index,
+            persistent=False,
+        )
+
+    # def forward(self, previous_weather_state: torch.Tensor, num_ensemble: int = 2) -> torch.Tensor:
+    #     """
+    #     Predict the next weather state given the previous weather state
+    #
+    #     Run multiple predictions on the same inputs with different noise vectors to get an ensemble
+    #
+    #     Args:
+    #         previous_weather_state: Torch tensor
+    #             The previous weather state, shape (batch_size, num_channels, height, width).
+    #         num_ensemble: number of ensemble predictions to make, default is 2
+    #
+    #     Returns:
+    #         torch.Tensor: The predicted future weather state, shape
+    #             (batch_size, num_ensemble, num_channels, height, width).
+    #     """
+    #
+    #     previous_weather_state = einops.rearrange(
+    #         previous_weather_state, "b lon lat f -> b (lon lat) f"
+    #     )
+    #
+    #     predictions = []
+    #     for ensemble in range(num_ensemble):
+    #         noise_vector = torch.randn(
+    #             (previous_weather_state.shape[0], self.noise_dimension),
+    #             device=previous_weather_state.device,
+    #         )
+    #         latent_grid_nodes, latent_mesh_nodes = self._run_encoder(previous_weather_state)
+    #         latent_mesh_nodes = self._run_processor(latent_mesh_nodes, noise_vectors=noise_vector)
+    #         out = self._run_decoder(latent_mesh_nodes, latent_grid_nodes)
+    #         # restore lon/lat dimensions.
+    #         prediction = einops.rearrange(out, "b (lon lat) f -> b lon lat f", lon=self.num_lon)
+    #         predictions.append(prediction)
+    #     return (
+    #         torch.stack(predictions, dim=1) if len(predictions) > 1 else predictions[0].unsqueeze(1)
+    #     )
+    def forward(self, previous_weather_state: torch.Tensor, num_ensemble: int = 2) -> torch.Tensor:
+        previous_weather_state = einops.rearrange(
+            previous_weather_state, "b lon lat f -> b (lon lat) f"
+        )
+
+        predictions = []
+        for ensemble in range(num_ensemble):
+            noise_vector = torch.randn(
+                (previous_weather_state.shape[0], self.noise_dimension),
+                device=previous_weather_state.device,
+            )
+
+            if self.enable_timing:
+                # —— Encoder 计时 ——
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+
+            latent_grid_nodes, latent_mesh_nodes = self._run_encoder(previous_weather_state)
+
+            if self.enable_timing:
+                torch.cuda.synchronize()
+                t1 = time.perf_counter()
+
+                # —— Processor 计时 ——
+            latent_mesh_nodes = self._run_processor(latent_mesh_nodes, noise_vectors=noise_vector)
+
+            if self.enable_timing:
+                torch.cuda.synchronize()
+                t2 = time.perf_counter()
+
+                # —— Decoder 计时 ——
+            out = self._run_decoder(latent_mesh_nodes, latent_grid_nodes)
+
+            if self.enable_timing:
+                torch.cuda.synchronize()
+                t3 = time.perf_counter()
+
+                self._timer["encoder"].append(t1 - t0)
+                self._timer["processor"].append(t2 - t1)
+                self._timer["decoder"].append(t3 - t2)
+
+                total = t3 - t0
+                n = len(self._timer["encoder"])
+                if n % 10 == 0:  # 每10次前向打印一次
+                    print(
+                        # f"[第{n}次 forward] "
+                        f"Encoder: {(sum(self._timer['encoder']) / n) * 1000:.1f} ms | "
+                        f"Processor: {(sum(self._timer['processor']) / n) * 1000:.1f} ms | "
+                        f"Decoder: {(sum(self._timer['decoder']) / n) * 1000:.1f} ms"
+                    )
+                    self._timer = {"encoder": [], "processor": [], "decoder": []}
+
+            prediction = einops.rearrange(out, "b (lon lat) f -> b lon lat f", lon=self.num_lon)
+            predictions.append(prediction)
+
+        return (
+            torch.stack(predictions, dim=1) if len(predictions) > 1 else predictions[0].unsqueeze(1)
+        )
