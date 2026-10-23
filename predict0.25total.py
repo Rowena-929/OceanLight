@@ -158,19 +158,6 @@ class LitModel(L.LightningModule):
             use_edges_features=use_edges_features,
             scale_factor=scale_factor,
         )
-        # self.model = VisionTransformer(
-        #     img_height=1440,
-        #     img_width=681,
-        #     in_channels=93,
-        #     embed_dim=512,
-        #     depth=4,
-        #     num_heads=8,
-        #     mlp_ratio=4.0,
-        #     dropout=0.1,
-        #     attn_dropout=0.1,
-        #     patch_size=8
-        # )
-        # self.model = UNet(n_channels=93, n_classes=93, bilinear=False)
 
         self.criterion = WeightedMSELoss(
             grid_lat=torch.tensor(fine_lat).to(self.device),
@@ -549,31 +536,12 @@ if __name__ == "__main__":
 
     checkpoint_callback = ModelCheckpoint(
         # dirpath="checkpoints/addmesh/",
-        dirpath=f"./checkpoints/mercator0.25total/addfourier2lightablation/lead{LEAD}",
+        dirpath=f"./checkpoints/mercator0.25total/lead{LEAD}",
         monitor="val_loss",
         mode="min",
         filename="{epoch}-{val_loss:.2f}",
         save_top_k=-1,
         # verbose=True
-    )
-
-    best_checkpoint = ModelCheckpoint(
-        dirpath=f"./checkpoints/mercator0.25total/addfourier/lead{LEAD}/best",
-        monitor="val_loss",
-        mode="min",
-        filename="best-{epoch:02d}-{val_loss:.4f}",
-        save_top_k=1,
-        save_weights_only=False,
-    )
-
-    # 最新模型
-    last_checkpoint = ModelCheckpoint(
-        dirpath=f"./checkpoints/mercator0.25total/addfourier/lead{LEAD}/last",
-        filename="last-{epoch:02d}",
-        save_last=True,
-        every_n_epochs=1,
-        save_on_train_epoch_end=True,
-        save_weights_only=False,
     )
 
     lr_monitor = LearningRateMonitor(logging_interval="step")
