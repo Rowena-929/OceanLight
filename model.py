@@ -124,7 +124,7 @@ class FunctionalGenerativeNetwork(torch.nn.Module, PyTorchModelHubMixin):
         self.output_features_dim = output_features_dim
         self.use_edges_features = use_edges_features
         self.noise_dimension = noise_dimension
-        fine_data = xr.open_dataset('./data/mercatorglorys12v1_gl12_mean_1993_2016_01.nc')
+        # fine_data = xr.open_dataset('./data/mercatorglorys12v1_gl12_mean_1993_2016_01.nc')#download a CMEMS reanalysis data and change the name respectively
         grid_features = np.load('./data/climatology/mean1.4.npy')
         grid_features = np.nan_to_num(grid_features, nan=0).squeeze(0)
         grid_features = np.transpose(grid_features, (1, 2, 0))  # shape: (121, 256, 94)
