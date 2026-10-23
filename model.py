@@ -132,7 +132,7 @@ class FunctionalGenerativeNetwork(torch.nn.Module, PyTorchModelHubMixin):
         grid_features = grid_features.reshape(-1, 94)  # shape: (30976, 94)
         # fine_lat = fine_data.latitude.values[::3]
         # fine_lon = fine_data.longitude.values[::3]
-        fine_grid_features = np.load('./data/climatology/mean.npy')[:,:,::3,::3].astype(np.float32)
+        fine_grid_features = np.load('./data/climatology/mean.npy').astype(np.float32)
         fine_grid_features = np.delete(fine_grid_features, [1], axis=1)
         fine_grid_features = fine_grid_features.squeeze(0)
 
